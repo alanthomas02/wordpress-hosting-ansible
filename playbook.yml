@@ -1,0 +1,358 @@
+---
+- name: Setup WordPress, phpMyAdmin, and SFTP on Amazon Linux
+  hosts: webservers
+  become: yes
+
+  vars:
+    website_root: /home/alan/websitename/public
+    wordpress_db_name: wordpress_DB
+    wordpress_db_user: wpuser
+    wordpress_db_password: <wordpress_password>
+    domain_name: www.alanthomas.xyz
+    email: mail_id
+
+  tasks:
+
+    - name: Ensure user exists
+      user:
+        name: alan
+        state: present
+
+    - name: Create website directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: alan
+        group: alan
+        mode: '0755'
+      loop:
+        - /home/alan/websitename/public
+        - /home/alan/websitename/public/wordpress
+        - /home/alan/websitename/public/phpmyadmin
+
+    - name: Install PHP and PHP-FPM packages
+      package:
+        name:
+          - php
+          - php-fpm
+          - php-mysqlnd
+          - php-gd
+          - php-mbstring
+          - php-xml
+          - php-json
+          - php-curl
+        state: present
+
+    - name: Install required packages 
+      package:
+        name:
+          - nginx
+          - php
+          - php-mysqlnd
+          - mariadb105-server
+          - unzip
+        state: present
+
+    - name: Start and enable PHP-FPM
+      service:
+        name: php-fpm
+        state: started
+        enabled: yes
+
+
+    - name: Start and enable Nginx
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Start and enable MariaDB
+      service:
+        name: mariadb
+        state: started
+        enabled: yes
+
+    - name: Download and extract WordPress
+      unarchive:
+        src: https://wordpress.org/latest.tar.gz
+        dest: /home/alan/websitename/public/wordpress
+        remote_src: yes
+        extra_opts: [--strip-components=1]
+        owner: alan
+        group: alan
+
+
+    - name: Create templates directory under ansible (local)
+      delegate_to: localhost
+      file:
+        path: "./templates"
+        state: directory
+        mode: '0755'
+
+    - name: Create wp-config.php.j2 template
+      delegate_to: localhost
+      copy:
+        dest: "./templates/wp-config.php.j2"
+        content: |
+          <?php
+          define( 'DB_NAME', '{{ wordpress_db_name }}' );
+          define( 'DB_USER', '{{ wordpress_db_user }}' );
+          define( 'DB_PASSWORD', '{{ wordpress_db_password }}' );
+          define( 'DB_HOST', 'localhost' );
+          define( 'DB_CHARSET', 'utf8' );
+          define( 'DB_COLLATE', '' );
+
+          $table_prefix = 'wp_';
+
+          define( 'WP_DEBUG', false );
+
+          if ( !defined('ABSPATH') )
+              define('ABSPATH', dirname(__FILE__) . '/');
+
+          require_once( ABSPATH . 'wp-settings.php' );
+          ?>
+
+    - name: Configure wp-config.php
+      template:
+        src: wp-config.php.j2
+        dest: /home/alan/websitename/public/wordpress/wp-config.php
+        owner: alan
+        group: alan
+        mode: '0644'
+
+
+    - name: Download and extract phpMyAdmin
+      unarchive:
+        src: https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.tar.gz
+        dest: /home/alan/websitename/public/phpmyadmin
+        remote_src: yes
+        extra_opts: [--strip-components=1]
+        owner: alan
+        group: alan
+
+
+    - name: Ensure /home/alan is accessible to others
+      file:
+        path: /home/alan
+        mode: '0755'
+        owner: root
+        group: root
+
+
+    - name: Set correct ownership for websitename directories
+      file:
+        path: "/home/alan/websitename"
+        owner: nginx
+        group: nginx
+        recurse: yes
+
+    - name: Ensure correct permissions for websitename directories
+      file:
+        path: "/home/alan/websitename"
+        mode: "0755"
+        recurse: yes
+
+    - name: Install Certbot using Amazon Linux Extras
+      shell: |
+        amazon-linux-extras enable nginx1
+        yum install -y nginx
+        amazon-linux-extras install epel
+        yum install -y certbot python3-certbot-nginx
+      args:
+        creates: /usr/bin/certbot
+
+
+    - name: Install Certbot
+      yum:
+        name:
+          - certbot
+          - python3-certbot-nginx
+        state: present
+
+    - name: Configure Nginx to serve WordPress and phpMyAdmin
+      copy:
+        dest: /etc/nginx/conf.d/wordpress.conf
+        content: |
+
+          server {
+              listen 80;
+              server_name www.alanthomas.xyz;
+
+              root /home/alan/websitename/public/wordpress;
+              index index.php index.html index.htm;
+
+              location / {
+                  try_files $uri $uri/ /index.php?$args;
+              }
+
+              location ~ \.php$ {
+                  include fastcgi_params;
+                  fastcgi_pass unix:/run/php-fpm/www.sock;   # or unix:/run/php-fpm/www.sock;
+                  fastcgi_index index.php;
+                  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+             }
+
+             location /phpmyadmin {
+                 root /home/alan/websitename/public;
+                 index index.php index.html index.htm;
+
+                 location ~ \.php$ {
+                     include fastcgi_params;
+                     fastcgi_pass unix:/run/php-fpm/www.sock;
+                     fastcgi_index index.php;
+                     fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                 }
+             }
+          }
+
+
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+
+    - name: Obtain SSL certificate for your domain
+      command: >
+        certbot --nginx
+        --non-interactive
+        --agree-tos
+        --email {{ email }}
+        -d {{ domain_name }}
+      args:
+        creates: /etc/letsencrypt/live/www.alanthomas.xyz/fullchain.pem
+
+
+    - name: Configure Nginx to serve WordPress and phpMyAdmin with HTTPS and redirect HTTP
+      copy:
+        dest: /etc/nginx/conf.d/wordpress.conf
+        content: |
+          server {
+             listen 80;
+             server_name {{ domain_name }};
+             return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl;
+              server_name {{ domain_name }};
+
+              ssl_certificate /etc/letsencrypt/live/{{ domain_name }}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/{{ domain_name }}/privkey.pem;
+
+              root /home/alan/websitename/public/wordpress;
+              index index.php index.html index.htm;
+
+              location / {
+                  try_files $uri $uri/ /index.php?$args;
+              }
+
+              location ~ \.php$ {
+                  include fastcgi_params;
+                  fastcgi_pass unix:/run/php-fpm/www.sock;
+                  fastcgi_index index.php;
+                  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+              }
+
+              location /phpmyadmin {
+                  root /home/alan/websitename/public;
+                  index index.php index.html index.htm;
+
+                  location ~ \.php$ {
+                      include fastcgi_params;
+                      fastcgi_pass unix:/run/php-fpm/www.sock;
+                      fastcgi_index index.php;
+                      fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                  }
+              }
+          }
+
+
+    - name: Reload Nginx to apply HTTPS config
+      systemd:
+        name: nginx
+        state: reloaded
+
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+
+    - name: Install pip3
+      ansible.builtin.yum:
+        name: python3-pip
+        state: present
+
+    - name: Ensure PyMySQL is installed
+      ansible.builtin.pip:
+        name: PyMySQL
+        executable: pip3
+
+    - name: Ensure user exists
+      user:
+        name: alan
+        state: present
+
+    - name: Create WordPress database
+      community.mysql.mysql_db:
+        name: "{{ wordpress_db_name }}"
+        state: present
+        login_unix_socket: /var/lib/mysql/mysql.sock
+      become: true
+
+    - name: Create WordPress database user
+      community.mysql.mysql_user:
+        name: "{{ wordpress_db_user }}"
+        password: "{{ wordpress_db_password }}"
+        priv: "{{ wordpress_db_name }}.*:ALL"
+        host: "localhost"
+        state: present
+        login_unix_socket: /var/lib/mysql/mysql.sock
+      become: true
+
+        # SFTP configuration tasks
+
+    - name: check whether sftp user exists
+      user:
+        name: alan
+        password: "{{ 'sftp@123' | password_hash('sha512') }}"
+        state: present
+        create_home: yes
+
+    - name: Ensure the SFTP subsystem is enabled in sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^Subsystem\s+sftp'
+        line: 'Subsystem sftp internal-sftp'
+        state: present
+      notify: Restart sshd
+
+    - name: ensure if password authentication is yes
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication yes'
+      notify: Restart sshd
+
+    - name: Configure SFTP-only access for user 'alan'
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED BLOCK FOR SFTP"
+        block: |
+          Match User alan
+              ChrootDirectory /home/alan
+              ForceCommand internal-sftp
+              AllowTcpForwarding no
+              X11Forwarding no
+
+    - name: Reload Nginx after certificate installation
+      service:
+        name: nginx
+        state: reloaded
+
+  handlers:
+    - name: Restart sshd
+      service:
+        name: sshd
+        state: restarted
+
